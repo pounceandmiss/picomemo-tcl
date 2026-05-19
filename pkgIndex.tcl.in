@@ -1,0 +1,2 @@
+package ifneeded omemo @VERSION@ \
+    [list load [file join $dir libtcl9omemo@VERSION@.so] Omemo]
