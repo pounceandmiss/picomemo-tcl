@@ -6,6 +6,8 @@
 #include <sys/random.h>
 #include <errno.h>
 
+#include <mbedtls/gcm.h>
+
 #include "omemo.h"
 
 #ifndef PACKAGE_VERSION
@@ -211,6 +213,67 @@ static int OmemoDecryptMessageCmd(ClientData cd, Tcl_Interp *ip, int objc, Tcl_O
     unsigned char *out = Tcl_SetByteArrayLength(outObj, ctn);
     int rc = omemoDecryptMessage(out, key, (size_t)keyn, iv, ct, (size_t)ctn);
     if (rc != 0) { Tcl_DecrRefCount(outObj); return SetOmemoError(ip, rc); }
+    Tcl_SetObjResult(ip, outObj);
+    return TCL_OK;
+}
+
+/* ::omemo::media_encrypt plaintext -> dict {ct <ciphertext||16-tag> key <32> iv <12>}
+ * AES-256-GCM for XEP-0454 media sharing: fresh key+iv, tag appended to ct. */
+static int MediaEncryptCmd(ClientData cd, Tcl_Interp *ip, int objc, Tcl_Obj *const objv[]) {
+    (void)cd;
+    if (objc != 2) { Tcl_WrongNumArgs(ip, 1, objv, "plaintext"); return TCL_ERROR; }
+    Tcl_Size n = 0;
+    unsigned char *plain = Tcl_GetByteArrayFromObj(objv[1], &n);
+    uint8_t key[32];
+    uint8_t iv[12];
+    int r = omemoRandom(key, 32);
+    if (!r) r = omemoRandom(iv, 12);
+    Tcl_Obj *ctObj = Tcl_NewByteArrayObj(NULL, n + 16);
+    unsigned char *ct = Tcl_SetByteArrayLength(ctObj, n + 16);
+    mbedtls_gcm_context g;
+    mbedtls_gcm_init(&g);
+    if (!r) r = mbedtls_gcm_setkey(&g, MBEDTLS_CIPHER_ID_AES, key, 256);
+    if (!r) r = mbedtls_gcm_crypt_and_tag(&g, MBEDTLS_GCM_ENCRYPT, (size_t)n, iv, 12,
+                                          (const unsigned char *)"", 0, plain, ct, 16, ct + n);
+    mbedtls_gcm_free(&g);
+    if (r) {
+        SecureZero(key, sizeof(key));
+        SecureZero(iv,  sizeof(iv));
+        Tcl_DecrRefCount(ctObj);
+        return SetOmemoError(ip, OMEMO_ECRYPTO);
+    }
+    Tcl_Obj *result = Tcl_NewDictObj();
+    Tcl_DictObjPut(NULL, result, Tcl_NewStringObj("ct",  2), ctObj);
+    Tcl_DictObjPut(NULL, result, Tcl_NewStringObj("key", 3), Tcl_NewByteArrayObj(key, 32));
+    Tcl_DictObjPut(NULL, result, Tcl_NewStringObj("iv",  2), Tcl_NewByteArrayObj(iv, 12));
+    SecureZero(key, sizeof(key));
+    SecureZero(iv,  sizeof(iv));
+    Tcl_SetObjResult(ip, result);
+    return TCL_OK;
+}
+
+/* ::omemo::media_decrypt key iv ct -> plaintext  (ct = ciphertext||16-tag)
+ * key must be 32 bytes; iv length taken from the byte array (some senders use
+ * 16); ct must be at least 16 bytes. */
+static int MediaDecryptCmd(ClientData cd, Tcl_Interp *ip, int objc, Tcl_Obj *const objv[]) {
+    (void)cd;
+    if (objc != 4) { Tcl_WrongNumArgs(ip, 1, objv, "key iv ct"); return TCL_ERROR; }
+    Tcl_Size keyn = 0, ivn = 0, ctn = 0;
+    unsigned char *key = Tcl_GetByteArrayFromObj(objv[1], &keyn);
+    unsigned char *iv  = Tcl_GetByteArrayFromObj(objv[2], &ivn);
+    unsigned char *ct  = Tcl_GetByteArrayFromObj(objv[3], &ctn);
+    if (keyn != 32 || ctn < 16) return SetOmemoError(ip, OMEMO_EPARAM);
+    Tcl_Size plen = ctn - 16;
+    Tcl_Obj *outObj = Tcl_NewByteArrayObj(NULL, plen);
+    unsigned char *out = Tcl_SetByteArrayLength(outObj, plen);
+    mbedtls_gcm_context g;
+    mbedtls_gcm_init(&g);
+    int r = mbedtls_gcm_setkey(&g, MBEDTLS_CIPHER_ID_AES, key, 256);
+    if (!r) r = mbedtls_gcm_auth_decrypt(&g, (size_t)plen, iv, (size_t)ivn,
+                                         (const unsigned char *)"", 0,
+                                         ct + plen, 16, ct, out);
+    mbedtls_gcm_free(&g);
+    if (r) { Tcl_DecrRefCount(outObj); return SetOmemoError(ip, OMEMO_ECRYPTO); }
     Tcl_SetObjResult(ip, outObj);
     return TCL_OK;
 }
@@ -676,6 +739,8 @@ DLLEXPORT int Omemo_Init(Tcl_Interp *interp) {
     Tcl_CreateObjCommand(interp, "::omemo::set_storage",     OmemoSetStorageCmd,     NULL, NULL);
     Tcl_CreateObjCommand(interp, "::omemo::encrypt_message", OmemoEncryptMessageCmd, NULL, NULL);
     Tcl_CreateObjCommand(interp, "::omemo::decrypt_message", OmemoDecryptMessageCmd, NULL, NULL);
+    Tcl_CreateObjCommand(interp, "::omemo::media_encrypt",   MediaEncryptCmd,        NULL, NULL);
+    Tcl_CreateObjCommand(interp, "::omemo::media_decrypt",   MediaDecryptCmd,        NULL, NULL);
     Tcl_CreateObjCommand(interp, "::omemo::store",           OmemoStoreCmd,          NULL, NULL);
     Tcl_CreateObjCommand(interp, "::omemo::session",         OmemoSessionCmd,        NULL, NULL);
     return Tcl_PkgProvide(interp, "omemo", PACKAGE_VERSION);

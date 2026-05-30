@@ -53,6 +53,39 @@ test message-aes-1.0 {encrypt_message/decrypt_message round-trip} -body {
     expr {$out eq $plain}
 } -result 1
 
+test media-aes-1.0 {media_encrypt/media_decrypt round-trip (XEP-0454)} -body {
+    set plain "the quick brown fox jumps over the lazy dog"
+    set enc [omemo::media_encrypt $plain]
+    set ct  [dict get $enc ct]
+    set key [dict get $enc key]
+    set iv  [dict get $enc iv]
+    set out [omemo::media_decrypt $key $iv $ct]
+    list key_len [string length $key] iv_len [string length $iv] \
+         ct_grew [expr {[string length $ct] == [string length $plain] + 16}] \
+         match [expr {$out eq $plain}]
+} -result {key_len 32 iv_len 12 ct_grew 1 match 1}
+
+test media-aes-1.1 {media_decrypt rejects a tampered ciphertext} -body {
+    set enc [omemo::media_encrypt "secret payload"]
+    set ct  [dict get $enc ct]
+    # Flip one bit in the first ciphertext byte.
+    binary scan $ct cu* bytes
+    lset bytes 0 [expr {[lindex $bytes 0] ^ 0x01}]
+    set bad [binary format cu* $bytes]
+    omemo::media_decrypt [dict get $enc key] [dict get $enc iv] $bad
+} -returnCodes error -match glob -result {*ECRYPTO*}
+
+test media-aes-1.2 {media_decrypt rejects a wrong key} -body {
+    set enc [omemo::media_encrypt "another secret"]
+    set wrong [string repeat \x00 32]
+    omemo::media_decrypt $wrong [dict get $enc iv] [dict get $enc ct]
+} -returnCodes error -match glob -result {*ECRYPTO*}
+
+test media-aes-1.3 {media_decrypt rejects a short key} -body {
+    set enc [omemo::media_encrypt "x"]
+    omemo::media_decrypt [string repeat \x00 16] [dict get $enc iv] [dict get $enc ct]
+} -returnCodes error -match glob -result {*EPARAM*}
+
 test session-initiate-1.0 {Alice initiates against Bob's bundle and round-trips a key} -setup {
     ::th::open_skipped_db [file join [file dirname [info script]] skipped.db]
     ::th::wire_storage
