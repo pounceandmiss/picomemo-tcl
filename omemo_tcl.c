@@ -3,8 +3,13 @@
 #include <stdlib.h>
 #include <stdint.h>
 #include <stdbool.h>
-#include <sys/random.h>
-#include <errno.h>
+#ifdef _WIN32
+#  include <windows.h>
+#  include <bcrypt.h>
+#else
+#  include <sys/random.h>
+#  include <errno.h>
+#endif
 
 #include <mbedtls/gcm.h>
 
@@ -648,6 +653,12 @@ static int SessionSubCmd(ClientData cd, Tcl_Interp *ip, int objc, Tcl_Obj *const
 }
 
 int omemoRandom(void *p, size_t n) {
+#ifdef _WIN32
+    /* fills the whole buffer or fails, so no resume loop */
+    NTSTATUS s = BCryptGenRandom(NULL, (PUCHAR)p, (ULONG)n,
+                                 BCRYPT_USE_SYSTEM_PREFERRED_RNG);
+    return BCRYPT_SUCCESS(s) ? 0 : OMEMO_ECRYPTO;
+#else
     uint8_t *out = (uint8_t *)p;
     while (n > 0) {
         ssize_t r = getrandom(out, n, 0);
@@ -659,6 +670,7 @@ int omemoRandom(void *p, size_t n) {
         n   -= (size_t)r;
     }
     return 0;
+#endif
 }
 
 int omemoLoadMessageKey(struct omemoSession *sess, struct omemoMessageKey *sk) {
