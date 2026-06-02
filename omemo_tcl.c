@@ -127,6 +127,26 @@ static int OmemoVersionCmd(ClientData cd, Tcl_Interp *ip, int objc, Tcl_Obj *con
     return TCL_OK;
 }
 
+static int OmemoRandomCmd(ClientData cd, Tcl_Interp *ip, int objc, Tcl_Obj *const objv[]) {
+    (void)cd;
+    if (objc != 2) { Tcl_WrongNumArgs(ip, 1, objv, "nbytes"); return TCL_ERROR; }
+    int n = 0;
+    if (Tcl_GetIntFromObj(ip, objv[1], &n) != TCL_OK) return TCL_ERROR;
+    if (n <= 0 || n > 4096) {
+        Tcl_SetObjResult(ip, Tcl_NewStringObj("nbytes must be 1..4096", -1));
+        return TCL_ERROR;
+    }
+    Tcl_Obj *res = Tcl_NewByteArrayObj(NULL, n);
+    unsigned char *buf = Tcl_GetByteArrayFromObj(res, NULL);
+    if (omemoRandom(buf, (size_t)n) != 0) {
+        Tcl_DecrRefCount(res);
+        Tcl_SetObjResult(ip, Tcl_NewStringObj("rng failed", -1));
+        return TCL_ERROR;
+    }
+    Tcl_SetObjResult(ip, res);
+    return TCL_OK;
+}
+
 static int OmemoFingerprintCmd(ClientData cd, Tcl_Interp *ip, int objc, Tcl_Obj *const objv[]) {
     (void)cd;
     if (objc != 2) { Tcl_WrongNumArgs(ip, 1, objv, "ik_bytes"); return TCL_ERROR; }
@@ -747,6 +767,7 @@ DLLEXPORT int Omemo_Init(Tcl_Interp *interp) {
         Tcl_ResetResult(interp);
     }
     Tcl_CreateObjCommand(interp, "::omemo::version",         OmemoVersionCmd,        NULL, NULL);
+    Tcl_CreateObjCommand(interp, "::omemo::random",          OmemoRandomCmd,         NULL, NULL);
     Tcl_CreateObjCommand(interp, "::omemo::fingerprint",     OmemoFingerprintCmd,    NULL, NULL);
     Tcl_CreateObjCommand(interp, "::omemo::set_storage",     OmemoSetStorageCmd,     NULL, NULL);
     Tcl_CreateObjCommand(interp, "::omemo::encrypt_message", OmemoEncryptMessageCmd, NULL, NULL);
