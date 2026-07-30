@@ -3,9 +3,15 @@
 #include <stdlib.h>
 #include <stdint.h>
 #include <stdbool.h>
+#if defined(__APPLE__) || defined(__FreeBSD__) || defined(__OpenBSD__) || \
+    defined(__NetBSD__) || defined(__DragonFly__)
+#  define OMEMO_RNG_ARC4RANDOM 1
+#endif
+
 #ifdef _WIN32
 #  include <windows.h>
 #  include <bcrypt.h>
+#elif defined(OMEMO_RNG_ARC4RANDOM)
 #else
 #  include <sys/random.h>
 #  include <errno.h>
@@ -678,6 +684,9 @@ int omemoRandom(void *p, size_t n) {
     NTSTATUS s = BCryptGenRandom(NULL, (PUCHAR)p, (ULONG)n,
                                  BCRYPT_USE_SYSTEM_PREFERRED_RNG);
     return BCRYPT_SUCCESS(s) ? 0 : OMEMO_ECRYPTO;
+#elif defined(OMEMO_RNG_ARC4RANDOM)
+    arc4random_buf(p, n);
+    return 0;
 #else
     uint8_t *out = (uint8_t *)p;
     while (n > 0) {
