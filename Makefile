@@ -2,6 +2,11 @@ VER         := 0.3.0
 CC          ?= cc
 AR          ?= ar
 DESTDIR     ?=
+# Objects and artifacts land here; point it elsewhere for an out-of-tree build.
+OUTDIR      ?= .
+# Where objects and artifacts land. Point it elsewhere to keep a cross-build's
+# output out of the source tree.
+OUTDIR      ?= .
 
 # ---- Tcl 9 detection ------------------------------------------------------
 # Picks the first tclConfig.sh whose TCL_VERSION starts with "9.".
@@ -55,27 +60,27 @@ COMMON_CF   := $(WARN_FLAGS) -I$(PICO_DIR) $(TCL_INCLUDE) $(MBED_INCLUDE) \
 PIC_CF      := $(COMMON_CF) -fPIC
 STATIC_CF   := $(COMMON_CF)
 
-OUT_SO      := libtcl9omemo$(VER).so
-OUT_A       := libtcl9omemo$(VER).a
-PKGINDEX    := pkgIndex.tcl
+OUT_SO      := $(OUTDIR)/libtcl9omemo$(VER).so
+OUT_A       := $(OUTDIR)/libtcl9omemo$(VER).a
+PKGINDEX    := $(OUTDIR)/pkgIndex.tcl
 
 SO_LDFLAGS  := -shared $(TCL_STUB_LIB) $(MBED_LIB) $(LDFLAGS)
 
-PIC_OBJS    := $(patsubst %.c,build/pic/%.o,$(notdir $(SRCS)))
-STATIC_OBJS := $(patsubst %.c,build/static/%.o,$(notdir $(SRCS)))
+PIC_OBJS    := $(patsubst %.c,$(OUTDIR)/build/pic/%.o,$(notdir $(SRCS)))
+STATIC_OBJS := $(patsubst %.c,$(OUTDIR)/build/static/%.o,$(notdir $(SRCS)))
 
 vpath %.c . $(PICO_DIR)
 
 .PHONY: all test clean config
 all: $(OUT_SO) $(OUT_A) $(PKGINDEX)
 
-build/pic build/static:
+$(OUTDIR)/build/pic $(OUTDIR)/build/static:
 	mkdir -p $@
 
-build/pic/%.o: %.c | build/pic
+$(OUTDIR)/build/pic/%.o: %.c | $(OUTDIR)/build/pic
 	$(CC) $(PIC_CF) -c $< -o $@
 
-build/static/%.o: %.c | build/static
+$(OUTDIR)/build/static/%.o: %.c | $(OUTDIR)/build/static
 	$(CC) $(STATIC_CF) -c $< -o $@
 
 $(OUT_SO): $(PIC_OBJS)
@@ -85,6 +90,7 @@ $(OUT_A): $(STATIC_OBJS)
 	$(AR) rcs $@ $^
 
 $(PKGINDEX): pkgIndex.tcl.in
+	mkdir -p $(@D)
 	sed 's/@VERSION@/$(VER)/g' $< > $@
 
 # Tests need a tclsh that does NOT have omemo statically baked in, otherwise
@@ -97,11 +103,12 @@ test: all
 	cd tests && $(TCLSH) test_omemo.tcl
 
 clean:
-	rm -rf build $(OUT_SO) $(OUT_A) $(PKGINDEX) tests/*.db
+	rm -rf $(OUTDIR)/build $(OUT_SO) $(OUT_A) $(PKGINDEX) tests/*.db
 
 config:
 	@echo "VER:          $(VER)"
 	@echo "CC:           $(CC)"
+	@echo "OUTDIR:       $(OUTDIR)"
 	@echo "TCLCONFIG:    $(TCLCONFIG)"
 	@echo "TCL_INCLUDE:  $(TCL_INCLUDE)"
 	@echo "TCL_STUB_LIB: $(TCL_STUB_LIB)"
