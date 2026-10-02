@@ -12,6 +12,8 @@
 #  include <windows.h>
 #  include <bcrypt.h>
 #elif defined(OMEMO_RNG_ARC4RANDOM)
+#elif defined(__HAIKU__)
+#  include <unistd.h>
 #else
 #  include <sys/random.h>
 #  include <errno.h>
@@ -686,6 +688,16 @@ int omemoRandom(void *p, size_t n) {
     return BCRYPT_SUCCESS(s) ? 0 : OMEMO_ECRYPTO;
 #elif defined(OMEMO_RNG_ARC4RANDOM)
     arc4random_buf(p, n);
+    return 0;
+#elif defined(__HAIKU__)
+    /* No getrandom(); getentropy() takes at most 256 bytes a call. */
+    uint8_t *out = (uint8_t *)p;
+    while (n > 0) {
+        size_t chunk = n < 256 ? n : 256;
+        if (getentropy(out, chunk) != 0) return OMEMO_ECRYPTO;
+        out += chunk;
+        n   -= chunk;
+    }
     return 0;
 #else
     uint8_t *out = (uint8_t *)p;
