@@ -4,9 +4,6 @@ AR          ?= ar
 DESTDIR     ?=
 # Objects and artifacts land here; point it elsewhere for an out-of-tree build.
 OUTDIR      ?= .
-# Where objects and artifacts land. Point it elsewhere to keep a cross-build's
-# output out of the source tree.
-OUTDIR      ?= .
 
 # ---- Tcl 9 detection ------------------------------------------------------
 # Picks the first tclConfig.sh whose TCL_VERSION starts with "9.".
