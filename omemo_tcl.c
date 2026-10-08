@@ -29,10 +29,30 @@
 
 #define OMEMO_PROTO_VERSION "0.3"
 
-static Tcl_Obj    *g_load_cmd  = NULL;
-static Tcl_Obj    *g_store_cmd = NULL;
-static Tcl_Interp *g_interp    = NULL;
-static int         g_cb_err    = 0;
+typedef struct OmemoInterpState {
+    Tcl_Obj *load_cmd, *store_cmd;
+    int      cb_err;
+} OmemoInterpState;
+#define OMEMO_ASSOC_KEY "omemo::state"
+
+static void StateDeleteProc(void *cd, Tcl_Interp *ip) {
+    (void)ip;
+    OmemoInterpState *st = (OmemoInterpState *)cd;
+    if (st->load_cmd)  Tcl_DecrRefCount(st->load_cmd);
+    if (st->store_cmd) Tcl_DecrRefCount(st->store_cmd);
+    Tcl_Free(st);
+}
+
+static OmemoInterpState *GetState(Tcl_Interp *ip) {
+    OmemoInterpState *st =
+        (OmemoInterpState *)Tcl_GetAssocData(ip, OMEMO_ASSOC_KEY, NULL);
+    if (st == NULL) {
+        st = (OmemoInterpState *)Tcl_Alloc(sizeof(*st));
+        memset(st, 0, sizeof(*st));
+        Tcl_SetAssocData(ip, OMEMO_ASSOC_KEY, StateDeleteProc, st);
+    }
+    return st;
+}
 
 static void SecureZero(void *p, size_t n) {
     volatile uint8_t *vp = (volatile uint8_t *)p;
@@ -56,10 +76,11 @@ static int SetOmemoError(Tcl_Interp *ip, int rc) {
     for (size_t i = 0; i < sizeof(g_errs)/sizeof(g_errs[0]); ++i) {
         if (g_errs[i].rc == rc) { tag = g_errs[i].tag; break; }
     }
-    int callback_origin = (rc == OMEMO_EUSER && g_cb_err);
+    OmemoInterpState *st = GetState(ip);
+    int callback_origin = (rc == OMEMO_EUSER && st->cb_err);
     if (callback_origin) {
         tag = "ESTORAGE";
-        g_cb_err = 0;
+        st->cb_err = 0;
     } else {
         Tcl_SetObjResult(ip, Tcl_ObjPrintf("omemo: %s (rc=%d)", tag, rc));
     }
@@ -70,10 +91,14 @@ static int SetOmemoError(Tcl_Interp *ip, int rc) {
     return TCL_ERROR;
 }
 
+/* `base` must stay first: picomemo hands the callbacks a struct omemoSession *
+ * that is cast back to PicoSession *. */
 typedef struct PicoStore {
     struct omemoStore base;
     uint32_t    device_id;
     Tcl_Command cmd;
+    Tcl_Interp *interp;
+    int         busy;
 } PicoStore;
 
 typedef struct PicoSession {
@@ -81,18 +106,20 @@ typedef struct PicoSession {
     char       *jid;
     uint32_t    device_id;
     Tcl_Command cmd;
+    Tcl_Interp *interp;
+    int         busy;
 } PicoSession;
 
 static int StoreSubCmd(ClientData cd, Tcl_Interp *ip, int objc, Tcl_Obj *const objv[]);
 static int SessionSubCmd(ClientData cd, Tcl_Interp *ip, int objc, Tcl_Obj *const objv[]);
 
-static void StoreDeleteProc(ClientData cd) {
+static void StoreFreeProc(void *cd) {
     PicoStore *ps = (PicoStore *)cd;
     SecureZero(&ps->base, sizeof(ps->base));
     Tcl_Free(ps);
 }
 
-static void SessionDeleteProc(ClientData cd) {
+static void SessionFreeProc(void *cd) {
     PicoSession *ps = (PicoSession *)cd;
     SecureZero(&ps->base, sizeof(ps->base));
     if (ps->jid) {
@@ -100,6 +127,25 @@ static void SessionDeleteProc(ClientData cd) {
         Tcl_Free(ps->jid);
     }
     Tcl_Free(ps);
+}
+
+static void StoreDeleteProc(ClientData cd) {
+    PicoStore *ps = (PicoStore *)cd;
+    ps->cmd = NULL;
+    Tcl_EventuallyFree(ps, StoreFreeProc);
+}
+
+static void SessionDeleteProc(ClientData cd) {
+    PicoSession *ps = (PicoSession *)cd;
+    ps->cmd = NULL;
+    Tcl_EventuallyFree(ps, SessionFreeProc);
+}
+
+static int SetBusyError(Tcl_Interp *ip) {
+    Tcl_SetObjResult(ip, Tcl_NewStringObj(
+        "session is busy: re-entrant call from a storage callback", -1));
+    Tcl_SetErrorCode(ip, "OMEMO", "ESTATE", NULL);
+    return TCL_ERROR;
 }
 
 static PicoStore *LookupStore(Tcl_Interp *ip, Tcl_Obj *nameObj) {
@@ -194,13 +240,13 @@ static int OmemoSetStorageCmd(ClientData cd, Tcl_Interp *ip, int objc, Tcl_Obj *
         Tcl_SetObjResult(ip, Tcl_NewStringObj("both -load and -store are required", -1));
         return TCL_ERROR;
     }
+    OmemoInterpState *st = GetState(ip);
     Tcl_IncrRefCount(loadObj);
     Tcl_IncrRefCount(storeObj);
-    if (g_load_cmd)  Tcl_DecrRefCount(g_load_cmd);
-    if (g_store_cmd) Tcl_DecrRefCount(g_store_cmd);
-    g_load_cmd  = loadObj;
-    g_store_cmd = storeObj;
-    g_interp    = ip;
+    if (st->load_cmd)  Tcl_DecrRefCount(st->load_cmd);
+    if (st->store_cmd) Tcl_DecrRefCount(st->store_cmd);
+    st->load_cmd  = loadObj;
+    st->store_cmd = storeObj;
     return TCL_OK;
 }
 
@@ -339,6 +385,7 @@ static int StoreCreate(Tcl_Interp *ip, int objc, Tcl_Obj *const objv[]) {
     PicoStore *ps = (PicoStore *)Tcl_Alloc(sizeof(*ps));
     memset(ps, 0, sizeof(*ps));
     ps->device_id = dev;
+    ps->interp = ip;
     ps->cmd = Tcl_CreateObjCommand(ip, name, StoreSubCmd, ps, StoreDeleteProc);
     Tcl_SetObjResult(ip, objv[2]);
     return TCL_OK;
@@ -353,6 +400,14 @@ static int OmemoStoreCmd(ClientData cd, Tcl_Interp *ip, int objc, Tcl_Obj *const
     const char *sub = Tcl_GetString(objv[1]);
     if (strcmp(sub, "create") == 0) return StoreCreate(ip, objc, objv);
     Tcl_SetObjResult(ip, Tcl_ObjPrintf("unknown subcommand: %s", sub));
+    return TCL_ERROR;
+}
+
+static int RequireStoreInit(Tcl_Interp *ip, PicoStore *ps) {
+    if (ps->base.init) return TCL_OK;
+    Tcl_SetObjResult(ip, Tcl_NewStringObj(
+        "store is not set up (call setup or deserialize first)", -1));
+    Tcl_SetErrorCode(ip, "OMEMO", "ESTATE", NULL);
     return TCL_ERROR;
 }
 
@@ -427,6 +482,7 @@ static int StoreSubCmd(ClientData cd, Tcl_Interp *ip, int objc, Tcl_Obj *const o
     }
     if (strcmp(sub, "serialize") == 0) {
         if (objc != 2) { Tcl_WrongNumArgs(ip, 2, objv, NULL); return TCL_ERROR; }
+        if (RequireStoreInit(ip, ps) != TCL_OK) return TCL_ERROR;
         return StoreSerialize(ip, ps);
     }
     if (strcmp(sub, "deserialize") == 0) {
@@ -435,6 +491,7 @@ static int StoreSubCmd(ClientData cd, Tcl_Interp *ip, int objc, Tcl_Obj *const o
     }
     if (strcmp(sub, "identity_pub") == 0) {
         if (objc != 2) { Tcl_WrongNumArgs(ip, 2, objv, NULL); return TCL_ERROR; }
+        if (RequireStoreInit(ip, ps) != TCL_OK) return TCL_ERROR;
         Tcl_SetObjResult(ip, Tcl_NewByteArrayObj(ps->base.identity.pub, 32));
         return TCL_OK;
     }
@@ -445,27 +502,31 @@ static int StoreSubCmd(ClientData cd, Tcl_Interp *ip, int objc, Tcl_Obj *const o
     }
     if (strcmp(sub, "bundle") == 0) {
         if (objc != 2) { Tcl_WrongNumArgs(ip, 2, objv, NULL); return TCL_ERROR; }
+        if (RequireStoreInit(ip, ps) != TCL_OK) return TCL_ERROR;
         return StoreBundle(ip, ps);
     }
     if (strcmp(sub, "rotate_signed_prekey") == 0) {
         if (objc != 2) { Tcl_WrongNumArgs(ip, 2, objv, NULL); return TCL_ERROR; }
+        if (RequireStoreInit(ip, ps) != TCL_OK) return TCL_ERROR;
         int rc = omemoRotateSignedPreKey(&ps->base);
         if (rc != 0) return SetOmemoError(ip, rc);
         return TCL_OK;
     }
     if (strcmp(sub, "refill_prekeys") == 0) {
         if (objc != 2) { Tcl_WrongNumArgs(ip, 2, objv, NULL); return TCL_ERROR; }
+        if (RequireStoreInit(ip, ps) != TCL_OK) return TCL_ERROR;
         int rc = omemoRefillPreKeys(&ps->base);
         if (rc != 0) return SetOmemoError(ip, rc);
         return TCL_OK;
     }
     if (strcmp(sub, "mark_prekey_used") == 0) {
         if (objc != 3) { Tcl_WrongNumArgs(ip, 2, objv, "pk_id"); return TCL_ERROR; }
+        if (RequireStoreInit(ip, ps) != TCL_OK) return TCL_ERROR;
         return StoreMarkPrekeyUsed(ip, ps, objv[2]);
     }
     if (strcmp(sub, "destroy") == 0) {
         if (objc != 2) { Tcl_WrongNumArgs(ip, 2, objv, NULL); return TCL_ERROR; }
-        Tcl_DeleteCommandFromToken(ip, ps->cmd);
+        if (ps->cmd) Tcl_DeleteCommandFromToken(ip, ps->cmd);
         return TCL_OK;
     }
     Tcl_SetObjResult(ip, Tcl_ObjPrintf("unknown store subcommand: %s", sub));
@@ -494,6 +555,7 @@ static int SessionCreate(Tcl_Interp *ip, int objc, Tcl_Obj *const objv[]) {
     PicoSession *ps = (PicoSession *)Tcl_Alloc(sizeof(*ps));
     memset(ps, 0, sizeof(*ps));
     ps->device_id = dev;
+    ps->interp = ip;
     size_t jl = strlen(jid);
     ps->jid = (char *)Tcl_Alloc(jl + 1);
     memcpy(ps->jid, jid, jl + 1);
@@ -523,6 +585,7 @@ static int SessionInitiate(Tcl_Interp *ip, PicoSession *sess, int objc, Tcl_Obj 
     }
     PicoStore *store = LookupStore(ip, objv[2]);
     if (!store) return TCL_ERROR;
+    if (RequireStoreInit(ip, store) != TCL_OK) return TCL_ERROR;
     unsigned char *ik = NULL, *spk = NULL, *spks = NULL, *pk = NULL;
     Tcl_WideInt spk_id = 0, pk_id = 0;
     int have_ik=0, have_spk=0, have_spks=0, have_pk=0, have_spkid=0, have_pkid=0;
@@ -574,7 +637,7 @@ static int SessionEncryptKey(Tcl_Interp *ip, PicoSession *sess, Tcl_Obj *payload
     unsigned char *p = Tcl_GetByteArrayFromObj(payload, &n);
     struct omemoKeyMessage msg;
     memset(&msg, 0, sizeof(msg));
-    g_cb_err = 0;
+    GetState(ip)->cb_err = 0;
     int rc = omemoEncryptKey(&sess->base, &msg, p, (size_t)n);
     if (rc != 0) return SetOmemoError(ip, rc);
     Tcl_Obj *dict = Tcl_NewDictObj();
@@ -602,28 +665,56 @@ static int SessionDecryptKey(Tcl_Interp *ip, PicoSession *sess, int objc, Tcl_Ob
     }
     int isprekey = 0;
     if (Tcl_GetBooleanFromObj(ip, objv[5], &isprekey) != TCL_OK) return TCL_ERROR;
+    if (sess->busy || store->busy) return SetBusyError(ip);
+    /* copy: a storage callback may shimmer objv[3] */
+    unsigned char *msgcopy = (unsigned char *)Tcl_Alloc(n > 0 ? (size_t)n : 1);
+    if (n > 0) memcpy(msgcopy, msg, (size_t)n);
     uint8_t key[32];
     size_t keyn = sizeof(key);
-    g_cb_err = 0;
+    int result;
+    Tcl_Preserve(sess);
+    Tcl_Preserve(store);
+    sess->busy = store->busy = 1;
+    GetState(ip)->cb_err = 0;
     int rc = omemoDecryptKey(&sess->base, &store->base, key, &keyn,
-                             (bool)isprekey, msg, (size_t)n);
-    if (rc != 0) { SecureZero(key, sizeof(key)); return SetOmemoError(ip, rc); }
-    Tcl_SetObjResult(ip, Tcl_NewByteArrayObj(key, (Tcl_Size)keyn));
+                             (bool)isprekey, msgcopy, (size_t)n);
+    if (rc != 0) {
+        result = SetOmemoError(ip, rc);
+    } else {
+        Tcl_SetObjResult(ip, Tcl_NewByteArrayObj(key, (Tcl_Size)keyn));
+        result = TCL_OK;
+    }
     SecureZero(key, sizeof(key));
-    return TCL_OK;
+    Tcl_Free(msgcopy);
+    sess->busy = store->busy = 0;
+    Tcl_Release(store);
+    Tcl_Release(sess);
+    return result;
 }
 
 static int SessionHeartbeat(Tcl_Interp *ip, PicoSession *sess, Tcl_Obj *storeObj) {
     PicoStore *store = LookupStore(ip, storeObj);
     if (!store) return TCL_ERROR;
+    if (sess->busy || store->busy) return SetBusyError(ip);
     struct omemoKeyMessage msg;
     memset(&msg, 0, sizeof(msg));
-    g_cb_err = 0;
+    int result;
+    Tcl_Preserve(sess);
+    Tcl_Preserve(store);
+    sess->busy = store->busy = 1;
+    GetState(ip)->cb_err = 0;
     int rc = omemoHeartbeat(&sess->base, &store->base, &msg);
-    if (rc != 0) return SetOmemoError(ip, rc);
-    if (msg.n == 0) Tcl_SetObjResult(ip, Tcl_NewObj());
-    else            Tcl_SetObjResult(ip, Tcl_NewByteArrayObj(msg.p, (Tcl_Size)msg.n));
-    return TCL_OK;
+    if (rc != 0) {
+        result = SetOmemoError(ip, rc);
+    } else {
+        if (msg.n == 0) Tcl_SetObjResult(ip, Tcl_NewObj());
+        else            Tcl_SetObjResult(ip, Tcl_NewByteArrayObj(msg.p, (Tcl_Size)msg.n));
+        result = TCL_OK;
+    }
+    sess->busy = store->busy = 0;
+    Tcl_Release(store);
+    Tcl_Release(sess);
+    return result;
 }
 
 static int SessionSubCmd(ClientData cd, Tcl_Interp *ip, int objc, Tcl_Obj *const objv[]) {
@@ -673,7 +764,7 @@ static int SessionSubCmd(ClientData cd, Tcl_Interp *ip, int objc, Tcl_Obj *const
     }
     if (strcmp(sub, "destroy") == 0) {
         if (objc != 2) { Tcl_WrongNumArgs(ip, 2, objv, NULL); return TCL_ERROR; }
-        Tcl_DeleteCommandFromToken(ip, sess->cmd);
+        if (sess->cmd) Tcl_DeleteCommandFromToken(ip, sess->cmd);
         return TCL_OK;
     }
     Tcl_SetObjResult(ip, Tcl_ObjPrintf("unknown session subcommand: %s", sub));
@@ -716,12 +807,15 @@ int omemoRandom(void *p, size_t n) {
 
 int omemoLoadMessageKey(struct omemoSession *sess, struct omemoMessageKey *sk) {
     PicoSession *ps = (PicoSession *)sess;
-    if (g_load_cmd == NULL || g_interp == NULL) return OMEMO_ESTATE;
+    if (ps->interp == NULL) return OMEMO_ESTATE;
+    Tcl_Interp *interp = ps->interp;
+    OmemoInterpState *st = GetState(interp);
+    if (st->load_cmd == NULL) return OMEMO_ESTATE;
 
     Tcl_Obj **prefv;
     Tcl_Size  prefc;
-    if (Tcl_ListObjGetElements(g_interp, g_load_cmd, &prefc, &prefv) != TCL_OK) {
-        g_cb_err = 1;
+    if (Tcl_ListObjGetElements(interp, st->load_cmd, &prefc, &prefv) != TCL_OK) {
+        st->cb_err = 1;
         return OMEMO_EUSER;
     }
 
@@ -733,18 +827,24 @@ int omemoLoadMessageKey(struct omemoSession *sess, struct omemoMessageKey *sk) {
     argv[prefc + 2] = Tcl_NewByteArrayObj(sk->dh, 32);
     argv[prefc + 3] = Tcl_NewWideIntObj((Tcl_WideInt)sk->nr);
     for (Tcl_Size i = 0; i < argc; ++i) Tcl_IncrRefCount(argv[i]);
-    int code = Tcl_EvalObjv(g_interp, argc, argv, TCL_EVAL_GLOBAL);
+    int code = Tcl_EvalObjv(interp, argc, argv, TCL_EVAL_GLOBAL);
     for (Tcl_Size i = 0; i < argc; ++i) Tcl_DecrRefCount(argv[i]);
     Tcl_Free((char *)argv);
 
-    if (code != TCL_OK) { g_cb_err = 1; return OMEMO_EUSER; }
-    Tcl_Obj *res = Tcl_GetObjResult(g_interp);
+    if (code != TCL_OK) { st->cb_err = 1; return OMEMO_EUSER; }
+    Tcl_Obj *res = Tcl_GetObjResult(interp);
     Tcl_Size n = 0;
     unsigned char *bytes = Tcl_GetByteArrayFromObj(res, &n);
+    if (bytes == NULL) {
+        st->cb_err = 1;
+        Tcl_SetObjResult(interp, Tcl_NewStringObj(
+            "load callback returned a non-byte string, want 32 bytes or {}", -1));
+        return OMEMO_EUSER;
+    }
     if (n == 0) return 1;
     if (n != 32) {
-        g_cb_err = 1;
-        Tcl_SetObjResult(g_interp,
+        st->cb_err = 1;
+        Tcl_SetObjResult(interp,
             Tcl_ObjPrintf("load callback returned %ld bytes, want 32", (long)n));
         return OMEMO_EUSER;
     }
@@ -755,12 +855,15 @@ int omemoLoadMessageKey(struct omemoSession *sess, struct omemoMessageKey *sk) {
 int omemoStoreMessageKey(struct omemoSession *sess,
                          const struct omemoMessageKey *sk, uint64_t n) {
     PicoSession *ps = (PicoSession *)sess;
-    if (g_store_cmd == NULL || g_interp == NULL) return OMEMO_ESTATE;
+    if (ps->interp == NULL) return OMEMO_ESTATE;
+    Tcl_Interp *interp = ps->interp;
+    OmemoInterpState *st = GetState(interp);
+    if (st->store_cmd == NULL) return OMEMO_ESTATE;
 
     Tcl_Obj **prefv;
     Tcl_Size  prefc;
-    if (Tcl_ListObjGetElements(g_interp, g_store_cmd, &prefc, &prefv) != TCL_OK) {
-        g_cb_err = 1;
+    if (Tcl_ListObjGetElements(interp, st->store_cmd, &prefc, &prefv) != TCL_OK) {
+        st->cb_err = 1;
         return OMEMO_EUSER;
     }
 
@@ -774,16 +877,17 @@ int omemoStoreMessageKey(struct omemoSession *sess,
     argv[prefc + 4] = Tcl_NewByteArrayObj(sk->mk, 32);
     argv[prefc + 5] = Tcl_NewWideIntObj((Tcl_WideInt)n);
     for (Tcl_Size i = 0; i < argc; ++i) Tcl_IncrRefCount(argv[i]);
-    int code = Tcl_EvalObjv(g_interp, argc, argv, TCL_EVAL_GLOBAL);
+    int code = Tcl_EvalObjv(interp, argc, argv, TCL_EVAL_GLOBAL);
     for (Tcl_Size i = 0; i < argc; ++i) Tcl_DecrRefCount(argv[i]);
     Tcl_Free((char *)argv);
 
-    if (code != TCL_OK) { g_cb_err = 1; return OMEMO_EUSER; }
+    if (code != TCL_OK) { st->cb_err = 1; return OMEMO_EUSER; }
     return 0;
 }
 
 DLLEXPORT int Omemo_Init(Tcl_Interp *interp) {
     if (Tcl_InitStubs(interp, "9.0", 0) == NULL) return TCL_ERROR;
+    (void)GetState(interp);
     if (Tcl_CreateNamespace(interp, "::omemo", NULL, NULL) == NULL) {
         Tcl_ResetResult(interp);
     }

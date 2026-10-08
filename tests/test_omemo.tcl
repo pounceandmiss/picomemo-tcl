@@ -332,6 +332,160 @@ test callback-error-1.0 {store_mk error surfaces as {OMEMO ESTORAGE}} -setup {
     ::th::close_skipped_db
 } -match glob -result {caught {disk full} ecode {OMEMO ESTORAGE}}
 
+test store-uninit-1.0 {bundle on a store that was never set up is rejected} -body {
+    omemo::store create st -device 1001
+    set rc [catch {st bundle} msg opts]
+    st destroy
+    list rc $rc ecode [dict get $opts -errorcode]
+} -result {rc 1 ecode {OMEMO ESTATE}}
+
+test store-uninit-1.1 {initiate from a store that was never set up is rejected} -body {
+    omemo::store create bob_st -device 22
+    bob_st setup
+    set bundle [bob_st bundle]
+    set pre0   [lindex [dict get $bundle prekeys] 0]
+    omemo::store create alice_st -device 11
+    omemo::session create alice_sess -jid bob@example.com -device 22
+    set rc [catch {
+        alice_sess initiate alice_st \
+            -ik     [dict get $bundle ik] \
+            -spk    [dict get $bundle spk] \
+            -spks   [dict get $bundle spks] \
+            -pk     [dict get $pre0 pk] \
+            -spk-id [dict get $bundle spk_id] \
+            -pk-id  [dict get $pre0 id]
+    } msg opts]
+    alice_sess destroy
+    alice_st destroy
+    bob_st destroy
+    list rc $rc ecode [dict get $opts -errorcode]
+} -result {rc 1 ecode {OMEMO ESTATE}}
+
+test reentrancy-destroy-1.0 {destroying the session from the store callback does not crash} -setup {
+    ::th::open_skipped_db [file join [file dirname [info script]] skipped.db]
+    proc destroying_store {jid device dh nr mk n} {
+        catch {bob_session destroy}
+        store_mk $jid $device $dh $nr $mk $n
+    }
+    omemo::set_storage -load load_mk -store destroying_store
+} -body {
+    ::th::make_pair alice@example.com 11 bob@example.com 22
+    set hp [binary decode hex [string repeat 99 32]]
+    set h0 [alice_session encrypt_key $hp]
+    bob_session decrypt_key bob_store [dict get $h0 p] -prekey [dict get $h0 isprekey]
+
+    # Out-of-order delivery makes picomemo call the store callback mid-decrypt.
+    set p1 [binary decode hex [string repeat 11 32]]
+    set p2 [binary decode hex [string repeat 22 32]]
+    set m1 [alice_session encrypt_key $p1]
+    set m2 [alice_session encrypt_key $p2]
+
+    set rc [catch {
+        bob_session decrypt_key bob_store [dict get $m2 p] -prekey [dict get $m2 isprekey]
+    } out]
+    set ok [expr {$rc == 1 || $out eq $p2}]
+    set gone [expr {[info commands bob_session] eq {}}]
+    ::th::cleanup_pair
+    list ok $ok gone $gone
+} -cleanup {
+    omemo::set_storage -load load_mk -store store_mk
+    rename destroying_store {}
+    ::th::close_skipped_db
+} -result {ok 1 gone 1}
+
+test reentrancy-nested-1.0 {re-entering decrypt_key from the store callback is rejected} -setup {
+    ::th::open_skipped_db [file join [file dirname [info script]] skipped.db]
+    set ::nested_ecode {}
+    proc nested_store {jid device dh nr mk n} {
+        try {
+            bob_session decrypt_key bob_store \
+                [dict get $::nested_msg p] -prekey [dict get $::nested_msg isprekey]
+        } on error {msg opts} {
+            set ::nested_ecode [dict get $opts -errorcode]
+            return -options $opts $msg
+        }
+        store_mk $jid $device $dh $nr $mk $n
+    }
+    omemo::set_storage -load load_mk -store nested_store
+} -body {
+    ::th::make_pair alice@example.com 11 bob@example.com 22
+    set hp [binary decode hex [string repeat 99 32]]
+    set h0 [alice_session encrypt_key $hp]
+    bob_session decrypt_key bob_store [dict get $h0 p] -prekey [dict get $h0 isprekey]
+
+    set p1 [binary decode hex [string repeat 11 32]]
+    set p2 [binary decode hex [string repeat 22 32]]
+    set m1 [alice_session encrypt_key $p1]
+    set m2 [alice_session encrypt_key $p2]
+    set ::nested_msg $m1
+
+    set rc [catch {
+        bob_session decrypt_key bob_store [dict get $m2 p] -prekey [dict get $m2 isprekey]
+    } msg opts]
+    ::th::cleanup_pair
+    list rc $rc outer [dict get $opts -errorcode] inner $::nested_ecode
+} -cleanup {
+    omemo::set_storage -load load_mk -store store_mk
+    rename nested_store {}
+    unset -nocomplain ::nested_msg ::nested_ecode
+    ::th::close_skipped_db
+} -result {rc 1 outer {OMEMO ESTORAGE} inner {OMEMO ESTATE}}
+
+test interp-isolation-1.0 {set_storage in a child interp does not hijack the parent} -setup {
+    ::th::open_skipped_db [file join [file dirname [info script]] skipped.db]
+    set ::parent_calls 0
+    proc counting_load {args} { incr ::parent_calls; load_mk {*}$args }
+    proc counting_store {args} { incr ::parent_calls; store_mk {*}$args }
+    omemo::set_storage -load counting_load -store counting_store
+    interp create c
+    c eval [list set auto_path $::auto_path]
+    c eval {
+        package require omemo
+        set ::child_calls 0
+        proc child_load {args}  { incr ::child_calls; return {} }
+        proc child_store {args} { incr ::child_calls }
+        omemo::set_storage -load child_load -store child_store
+    }
+} -body {
+    ::th::make_pair alice@example.com 11 bob@example.com 22
+    set hp [binary decode hex [string repeat 99 32]]
+    set h0 [alice_session encrypt_key $hp]
+    bob_session decrypt_key bob_store [dict get $h0 p] -prekey [dict get $h0 isprekey]
+
+    set p1 [binary decode hex [string repeat 11 32]]
+    set p2 [binary decode hex [string repeat 22 32]]
+    set p3 [binary decode hex [string repeat 33 32]]
+    set p4 [binary decode hex [string repeat 44 32]]
+    set m1 [alice_session encrypt_key $p1]
+    set m2 [alice_session encrypt_key $p2]
+    set m3 [alice_session encrypt_key $p3]
+    set m4 [alice_session encrypt_key $p4]
+
+    # Out-of-order: store then load must hit the parent's callbacks.
+    set o2 [bob_session decrypt_key bob_store [dict get $m2 p] -prekey [dict get $m2 isprekey]]
+    set o1 [bob_session decrypt_key bob_store [dict get $m1 p] -prekey [dict get $m1 isprekey]]
+    set parent_before [set ::parent_calls]
+    set child_calls [c eval {set ::child_calls}]
+
+    # Deleting the child must leave the parent's callbacks intact.
+    interp delete c
+    set o4 [bob_session decrypt_key bob_store [dict get $m4 p] -prekey [dict get $m4 isprekey]]
+    set o3 [bob_session decrypt_key bob_store [dict get $m3 p] -prekey [dict get $m3 isprekey]]
+    set parent_after [set ::parent_calls]
+    set left [::th::skipped_count]
+    ::th::cleanup_pair
+    list match [expr {$o1 eq $p1 && $o2 eq $p2 && $o3 eq $p3 && $o4 eq $p4}] \
+         parent_used [expr {$parent_before > 0 && $parent_after > $parent_before}] \
+         child $child_calls left $left
+} -cleanup {
+    catch {interp delete c}
+    omemo::set_storage -load load_mk -store store_mk
+    rename counting_load {}
+    rename counting_store {}
+    unset -nocomplain ::parent_calls
+    ::th::close_skipped_db
+} -result {match 1 parent_used 1 child 0 left 0}
+
 catch {file delete -- [file join [file dirname [info script]] skipped.db]}
 
 cleanupTests

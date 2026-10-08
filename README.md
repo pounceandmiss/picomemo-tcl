@@ -54,6 +54,9 @@ Everything is in `::omemo`. Byte arguments are Tcl byte arrays.
 | `mark_prekey_used <id>`    |                                                        |
 | `destroy`                  | wipe and free                                          |
 
+Subcommands other than `setup`, `deserialize`, `device_id` and `destroy` return
+`{OMEMO ESTATE}` until the store is set up.
+
 ### Session
 
 `omemo::session create <name> -jid <bare> -device <uint32>`, then:
@@ -72,8 +75,10 @@ Everything is in `::omemo`. Byte arguments are Tcl byte arrays.
 ## Storage callbacks
 
 Skipped message keys are stored through two callbacks set with
-`omemo::set_storage`. They are global and must be set before any session
-call that might need them, otherwise you get `{OMEMO ESTATE}`.
+`omemo::set_storage`. They are per interpreter: each interp that loads the
+package has its own pair. They must be set before any session call that might
+need them, otherwise you get `{OMEMO ESTATE}`. Callbacks must not destroy or
+re-enter the session/store being decrypted; doing so returns `{OMEMO ESTATE}`.
 
 - `-load`: called as `cmd jid device dh nr`. Return the 32-byte key and delete
   it, or return `{}` if not found.
