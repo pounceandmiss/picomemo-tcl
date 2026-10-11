@@ -46,7 +46,7 @@ endif
 
 # ---- Sources --------------------------------------------------------------
 PICO_DIR    := picomemo
-PICO_SRCS   := $(PICO_DIR)/omemo.c $(PICO_DIR)/hacl.c
+PICO_SRCS   := $(PICO_DIR)/omemo.c $(PICO_DIR)/hacl.c $(PICO_DIR)/mbedtls.c
 SHIM_SRC    := omemo_tcl.c
 SRCS        := $(SHIM_SRC) $(PICO_SRCS)
 
